@@ -16,20 +16,29 @@ test('normalizePhone приводит номера к +7XXXXXXXXXX', () => {
 test('mergeFields принимает корректные значения и отклоняет мусор', () => {
   const lead = {};
   const { changed, rejected } = leads.mergeFields(lead, {
-    destination: 'Турция',
-    nights: '7',
-    adults: 2,
-    children: 0,
+    destination: 'Турция, Египет',
+    month: 'июль',
     budget_kzt: '1 000 000',
     phone: '123',
     name: null,
   });
   assert.strictEqual(changed, true);
   assert.deepStrictEqual(rejected, ['phone']);
-  assert.strictEqual(lead.nights, 7);
   assert.strictEqual(lead.budget_kzt, 1000000);
-  assert.strictEqual(lead.children_ages, 'нет'); // детей нет — возраст заполняется автоматически
   assert.strictEqual(lead.phone, undefined);
+});
+
+test('несколько направлений списком превращаются в строку', () => {
+  const lead = {};
+  leads.mergeFields(lead, { destination: ['Турция', 'ОАЭ', 'Египет'] });
+  assert.strictEqual(lead.destination, 'Турция, ОАЭ, Египет');
+});
+
+test('бюджет не числом отклоняется и не попадает в заявку', () => {
+  const lead = {};
+  const r = leads.mergeFields(lead, { budget_kzt: 'побольше' });
+  assert.deepStrictEqual(r.rejected, ['budget_kzt']);
+  assert.strictEqual(lead.budget_kzt, undefined);
 });
 
 test('телефон, которого клиент не писал, отклоняется (защита от выдумок модели)', () => {
@@ -43,21 +52,26 @@ test('телефон, которого клиент не писал, откло�
 
 test('«null» и «не указано» от модели не считаются данными', () => {
   const lead = {};
-  const r = leads.mergeFields(lead, { destination: 'null', dates: 'не указано', name: '' });
+  const r = leads.mergeFields(lead, { destination: 'null', month: 'не указано', name: '' });
   assert.deepStrictEqual(lead, {});
   assert.deepStrictEqual(r.rejected, []);
 });
 
-test('missingFields: возраст детей нужен только если дети есть', () => {
-  const full = {
-    destination: 'Турция', departure_city: 'Астана', dates: 'июнь', nights: 7, adults: 2,
-    children: 1, budget_kzt: 900000, preferences: 'всё включено', name: 'Иван', phone: '+77064120412',
-  };
-  assert.deepStrictEqual(leads.missingFields(full), ['children_ages']);
-  leads.mergeFields(full, { children_ages: '5 лет' });
-  assert.deepStrictEqual(leads.missingFields(full), []);
-  const noKids = { ...full, children: 0 };
-  assert.deepStrictEqual(leads.missingFields(noKids), []);
+test('missingFields: нужны только направление, месяц и бюджет', () => {
+  const lead = {};
+  assert.deepStrictEqual(leads.missingFields(lead), ['destination', 'month', 'budget_kzt']);
+  leads.mergeFields(lead, { destination: 'Турция', month: 'июль' });
+  assert.deepStrictEqual(leads.missingFields(lead), ['budget_kzt']);
+  leads.mergeFields(lead, { budget_kzt: 900000 });
+  assert.deepStrictEqual(leads.missingFields(lead), []); // имя и телефон не обязательны
+});
+
+test('notes накапливаются, а не затираются', () => {
+  const lead = {};
+  leads.mergeFields(lead, { notes: 'двое взрослых и ребёнок 6 лет' });
+  leads.mergeFields(lead, { notes: 'отель 5 звёзд' });
+  assert.match(lead.notes, /ребёнок 6 лет/);
+  assert.match(lead.notes, /5 звёзд/);
 });
 
 test('extractJson понимает обёртку ```json и обычный текст', () => {
@@ -66,18 +80,17 @@ test('extractJson понимает обёртку ```json и обычный те
   assert.strictEqual(extractJson('{ сломанный json }'), null);
 });
 
-test('summaryText и adminMessage содержат ключевые данные', () => {
-  const f = {
-    destination: 'Турция', departure_city: 'Астана', dates: 'июнь', nights: 7, adults: 2,
-    children: 1, children_ages: '5 лет', budget_kzt: 900000, preferences: 'всё включено',
-    name: 'Иван <b>', phone: '+77064120412',
-  };
-  assert.match(leads.summaryText(f), /Турция/);
+test('adminMessage содержит ключевые данные и экранирует HTML', () => {
   const msg = leads.adminMessage({
-    id: 1, created_at: new Date().toISOString(), partial: false,
-    client: { chat_id: 5, username: 'ivan', first_name: 'Иван' }, fields: f,
+    id: 1,
+    created_at: new Date().toISOString(),
+    partial: false,
+    client: { chat_id: 5, username: 'ivan', first_name: 'Иван <b>' },
+    fields: { destination: 'Турция, Египет', month: 'июль', budget_kzt: 900000 },
   });
+  assert.match(msg, /Турция, Египет/);
+  assert.match(msg, /июль/);
+  assert.match(msg, /900.000 ₸/);
   assert.match(msg, /@ivan/);
-  assert.match(msg, /Иван &lt;b&gt;/); // HTML экранируется
-  assert.match(msg, /\+7 706 412 04 12/);
+  assert.match(msg, /Иван &lt;b&gt;/);
 });

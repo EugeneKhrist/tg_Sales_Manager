@@ -49,7 +49,7 @@ async function callModel(model, system, messages) {
 }
 
 /**
- * Возвращает { reply, fields, confirmed, model }.
+ * Возвращает { reply, fields, model }.
  * Бросает LLMUnavailableError, если не ответила ни одна модель.
  */
 async function askModel({ system, messages }) {
@@ -64,7 +64,6 @@ async function askModel({ system, messages }) {
       return {
         reply: d.reply.trim(),
         fields: d.fields && typeof d.fields === 'object' ? d.fields : {},
-        confirmed: d.confirmed === true,
         model,
       };
     } catch (e) {

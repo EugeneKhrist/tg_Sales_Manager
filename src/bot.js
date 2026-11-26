@@ -1,5 +1,5 @@
 'use strict';
-// Логика бота: команды, кнопки, диалог с моделью, сбор и отправка заявки.
+// Логика бота: команды, кнопки, диалог, сбор и отправка заявки.
 
 const fs = require('fs');
 const config = require('./config');
@@ -13,6 +13,13 @@ const { sleep, log } = require('./util');
 const tg = new Telegram(config.botToken);
 const { agency } = config;
 
+// Отправка клиенту с записью в лог (видно, что бот ответил)
+async function say(chatId, text, extra) {
+  const result = await tg.sendMessage(chatId, text, extra);
+  log(`→ клиенту ${chatId}: ответ отправлен (${text.length} симв.)`);
+  return result;
+}
+
 // ---------- Тексты и клавиатуры ----------
 
 const BTN_TOUR = 'Подобрать тур';
@@ -24,16 +31,14 @@ const mainKeyboard = {
   resize_keyboard: true,
 };
 
-const confirmKeyboard = {
-  inline_keyboard: [
-    [{ text: '✅ Всё верно, отправить', callback_data: 'lead:confirm' }],
-    [{ text: '✏️ Изменить', callback_data: 'lead:edit' }],
-  ],
-};
-
 const GREETING =
   `Здравствуйте! Я виртуальный помощник турагентства «${agency.name}» ✈️ ` +
-  'Помогу подобрать поездку и оформить заявку для менеджера. Куда бы вы хотели поехать?';
+  'Помогу подобрать поездку. Куда бы вы хотели полететь? Можно назвать несколько вариантов.';
+
+const TOUR_START =
+  'Отлично, давайте подберём поездку 🙂 Куда бы вы хотели полететь? ' +
+  'Можно назвать несколько вариантов: Турция, ОАЭ, Египет, Таиланд, Грузия, Вьетнам, Мальдивы. ' +
+  'Если пока не знаете, расскажите, какой отдых хочется, и я подскажу.';
 
 const CONTACTS =
   `Турагентство «${agency.name}»\n` +
@@ -46,16 +51,13 @@ const OUTAGE_TEXT =
   'Пожалуйста, повторите сообщение чуть позже или оставьте номер телефона — менеджер перезвонит сам. ' +
   `Телефон агентства: ${agency.phone}.`;
 
-const CONFIRM_RE =
-  /^\s*(да|верно|всё верно|все верно|да,? (всё|все) верно|подтверждаю|согласен|согласна|ок|окей|отправляйте|отправляй|отправить)[\s.!)]*$/i;
-
 // ---------- Сессии (память о каждом клиенте) ----------
 
 const sessions = new Map();
 
 function getSession(chatId) {
   if (!sessions.has(chatId)) {
-    sessions.set(chatId, { history: [], lead: {}, stage: 'collecting', llmCalls: [], lastLeadId: null });
+    sessions.set(chatId, { history: [], lead: {}, llmCalls: [], lastLeadId: null });
   }
   return sessions.get(chatId);
 }
@@ -65,7 +67,7 @@ function pushHistory(s, role, content) {
   while (s.history.length > config.historyLimit) s.history.shift();
 }
 
-// Некоторые модели требуют строгого чередования user/assistant — приводим историю в порядок
+// Некоторые модели требуют строгого чередования user/assistant и первого сообщения от user
 function normalizeHistory(history) {
   const out = [];
   for (const m of history) {
@@ -73,7 +75,9 @@ function normalizeHistory(history) {
     if (last && last.role === m.role) last.content += '\n' + m.content;
     else out.push({ role: m.role, content: m.content });
   }
-  while (out.length && out[0].role !== 'user') out.shift();
+  if (out.length && out[0].role === 'assistant') {
+    out.unshift({ role: 'user', content: '(клиент открыл чат с ботом)' });
+  }
   return out;
 }
 
@@ -102,18 +106,11 @@ function stateBlock(s) {
     '## Текущее состояние заявки (служебная информация от системы; клиент её не видит, не цитируй её)',
     `Сегодня: ${todayRu()}. Офис сейчас ${isOfficeOpen() ? 'открыт' : 'закрыт'}.`,
     known.length ? 'Уже известно:\n' + known.join('\n') : 'Уже известно: пока ничего.',
-    missing.length
-      ? `Ещё не известно (спрашивай в этом порядке, один-два пункта за раз): ${missing.join(', ')}.`
-      : 'Все обязательные данные собраны.',
+    `Ещё не известно (спрашивай в этом порядке, по одному вопросу): ${missing.join(', ')}.`,
   ];
-  if (s.stage === 'confirming') {
+  if (s.lastLeadId && known.length === 0) {
     lines.push(
-      'Статус: сводка заявки уже показана клиенту, ждём подтверждения. ' +
-        'Согласился — верни confirmed: true. Хочет изменить — внеси новые значения в fields. Задал вопрос — ответь и напомни про подтверждение.'
-    );
-  } else if (s.lastLeadId) {
-    lines.push(
-      `Статус: заявка №${s.lastLeadId} уже отправлена менеджеру. Если клиент хочет ещё одну поездку — собираем новую заявку с нуля.`
+      `Статус: заявка №${s.lastLeadId} уже сохранена и передана менеджеру. Если клиент ничего нового не просит — не задавай вопросов про заявку, ответь на его вопрос и напомни, что менеджер свяжется. Хочет ещё одну поездку — собирай новую заявку.`
     );
   } else {
     lines.push('Статус: идёт сбор заявки.');
@@ -141,6 +138,7 @@ async function notifyAdmin(record) {
         disable_web_page_preview: true,
       });
       leads.markNotified(record.id);
+      log(`заявка №${record.id} отправлена владельцу`);
       return true;
     } catch (e) {
       log(`не удалось отправить заявку №${record.id} админу (попытка ${attempt}):`, e);
@@ -157,26 +155,18 @@ function clientFrom(from, chatId) {
 async function submitLead(chatId, from, s) {
   const record = leads.createLead({ fields: s.lead, client: clientFrom(from, chatId) });
   const sent = await notifyAdmin(record);
-  if (!sent) log(`заявка №${record.id} сохранена, но админу не доставлена — будет повтор при следующем запуске`);
+  if (!sent) log(`заявка №${record.id} сохранена, но владельцу не доставлена — повтор при следующем запуске`);
 
   s.lead = {};
-  s.stage = 'collecting';
   s.lastLeadId = record.id;
 
-  const open = isOfficeOpen();
   const text =
-    `Спасибо! Заявка №${record.id} принята ✅ Менеджер свяжется с вами в течение 30 минут в рабочее время (${agency.hoursText}).` +
-    (open ? '' : ' Сейчас офис закрыт, поэтому менеджер позвонит, как только мы откроемся.') +
+    '✅ Данные сохранены. Дальше с вами свяжется наш менеджер — в течение 30 минут в рабочее время ' +
+    `(${agency.hoursText}).` +
+    (isOfficeOpen() ? '' : ' Сейчас офис закрыт, поэтому менеджер напишет, как только мы откроемся.') +
     ' Если появятся вопросы, пишите сюда.';
   pushHistory(s, 'assistant', text);
-  await tg.sendMessage(chatId, text, { reply_markup: mainKeyboard });
-}
-
-async function showSummary(chatId, s) {
-  const text = leads.summaryText(s.lead);
-  s.stage = 'confirming';
-  pushHistory(s, 'assistant', text);
-  await tg.sendMessage(chatId, text, { reply_markup: confirmKeyboard });
+  await say(chatId, text, { reply_markup: mainKeyboard });
 }
 
 // Если модель недоступна: просим повторить позже или оставить телефон
@@ -192,10 +182,9 @@ async function handleOutage(chatId, from, s, text) {
     await notifyAdmin(record);
     const reply = `Спасибо, номер получен! Менеджер свяжется с вами в рабочее время (${agency.hoursText}).`;
     pushHistory(s, 'assistant', reply);
-    await tg.sendMessage(chatId, reply);
-    return;
+    return say(chatId, reply);
   }
-  await tg.sendMessage(chatId, OUTAGE_TEXT);
+  return say(chatId, OUTAGE_TEXT);
 }
 
 // ---------- Диалог с моделью ----------
@@ -204,14 +193,8 @@ async function converse(chatId, from, rawText) {
   const s = getSession(chatId);
   const text = rawText.slice(0, config.maxUserTextLength);
 
-  // Простое «да» при готовой сводке обрабатываем без модели — быстро и надёжно
-  if (s.stage === 'confirming' && CONFIRM_RE.test(text) && leads.missingFields(s.lead).length === 0) {
-    pushHistory(s, 'user', text);
-    return submitLead(chatId, from, s);
-  }
-
   if (!allowLlmCall(s)) {
-    return tg.sendMessage(chatId, 'Вы пишете очень часто — давайте чуть помедленнее. Подождите пару минут, и продолжим 🙂');
+    return say(chatId, 'Вы пишете очень часто — давайте чуть помедленнее. Подождите пару минут, и продолжим 🙂');
   }
 
   pushHistory(s, 'user', text);
@@ -234,30 +217,24 @@ async function converse(chatId, from, rawText) {
 
   // Данные заявки принимает и проверяет код, а не модель
   const userTexts = s.history.filter((m) => m.role === 'user').map((m) => m.content);
-  const { changed, rejected } = leads.mergeFields(s.lead, res.fields, { userTexts });
+  const { rejected } = leads.mergeFields(s.lead, res.fields, { userTexts });
 
-  if (rejected.length) {
-    const hint = leads.INVALID_HINT[rejected[0]];
-    if (hint) {
-      pushHistory(s, 'assistant', hint);
-      return tg.sendMessage(chatId, hint);
-    }
+  // Бюджет пришёл в неподходящем виде — просим уточнить (телефон/имя необязательны: тихо игнорируем)
+  if (rejected.includes('budget_kzt')) {
+    const hint = leads.INVALID_HINT.budget_kzt;
+    pushHistory(s, 'assistant', hint);
+    return say(chatId, hint);
   }
 
-  const missing = leads.missingFields(s.lead);
-  if (missing.length === 0) {
-    if (s.stage === 'confirming' && res.confirmed && !changed) return submitLead(chatId, from, s);
-    if (changed || s.stage === 'collecting') return showSummary(chatId, s);
-  } else {
-    s.stage = 'collecting';
-  }
+  // Все три обязательных поля есть — сохраняем и отправляем заявку
+  if (leads.missingFields(s.lead).length === 0) return submitLead(chatId, from, s);
 
   let reply = res.reply.slice(0, 1200);
   if (looksLikePromptLeak(reply)) {
     reply = 'Свои внутренние инструкции я не раскрываю, но с радостью помогу подобрать поездку. Куда бы вы хотели отправиться?';
   }
   pushHistory(s, 'assistant', reply);
-  return tg.sendMessage(chatId, reply);
+  return say(chatId, reply);
 }
 
 // ---------- Команды и кнопки ----------
@@ -266,7 +243,15 @@ async function sendDirections(chatId, s) {
   const text = directionsText();
   pushHistory(s, 'user', 'Покажите направления');
   pushHistory(s, 'assistant', text);
-  return tg.sendMessage(chatId, text, { reply_markup: mainKeyboard });
+  return say(chatId, text, { reply_markup: mainKeyboard });
+}
+
+async function startTour(chatId) {
+  const s = getSession(chatId);
+  s.lead = {};
+  pushHistory(s, 'user', 'Хочу подобрать тур');
+  pushHistory(s, 'assistant', TOUR_START);
+  return say(chatId, TOUR_START, { reply_markup: mainKeyboard });
 }
 
 async function handleCommand(msg, cmd) {
@@ -277,28 +262,26 @@ async function handleCommand(msg, cmd) {
     case '/reset':
       sessions.delete(chatId);
       getSession(chatId).history.push({ role: 'assistant', content: GREETING });
-      return tg.sendMessage(
-        chatId,
-        cmd === '/reset' ? `Начнём заново 🙂 ${GREETING}` : GREETING,
-        { reply_markup: mainKeyboard }
-      );
+      return say(chatId, cmd === '/reset' ? `Начнём заново 🙂 ${GREETING}` : GREETING, {
+        reply_markup: mainKeyboard,
+      });
     case '/directions':
       return sendDirections(chatId, s);
     case '/contacts':
-      return tg.sendMessage(chatId, CONTACTS, { reply_markup: mainKeyboard });
+      return say(chatId, CONTACTS, { reply_markup: mainKeyboard });
     case '/help':
-      return tg.sendMessage(
+      return say(
         chatId,
-        'Я помогу подобрать поездку и оформить заявку.\n/directions — направления\n/contacts — контакты агентства\n/reset — начать заново',
+        'Я помогу подобрать поездку.\n/directions — направления\n/contacts — контакты агентства\n/reset — начать заново',
         { reply_markup: mainKeyboard }
       );
     case '/leads':
       if (String(chatId) !== config.adminChatId) {
-        return tg.sendMessage(chatId, 'Не знаю такой команды. Напишите, куда хотите поехать 🙂');
+        return say(chatId, 'Не знаю такой команды. Напишите, куда хотите полететь 🙂');
       }
-      return tg.sendMessage(chatId, leads.leadsListText(leads.lastLeads(5)), { parse_mode: 'HTML' });
+      return say(chatId, leads.leadsListText(leads.lastLeads(5)), { parse_mode: 'HTML' });
     default:
-      return tg.sendMessage(chatId, 'Не знаю такой команды. Напишите, куда хотите поехать 🙂', {
+      return say(chatId, 'Не знаю такой команды. Напишите, куда хотите полететь 🙂', {
         reply_markup: mainKeyboard,
       });
   }
@@ -307,9 +290,10 @@ async function handleCommand(msg, cmd) {
 async function handleMessage(msg) {
   if (msg.chat.type !== 'private') return;
   const chatId = msg.chat.id;
+  log(`← сообщение от ${chatId}: ${String(msg.text ?? '[не текст]').slice(0, 60)}`);
 
   if (typeof msg.text !== 'string') {
-    return tg.sendMessage(chatId, 'Я понимаю только текстовые сообщения. Напишите, пожалуйста, словами 🙂');
+    return say(chatId, 'Я понимаю только текстовые сообщения. Напишите, пожалуйста, словами 🙂');
   }
   const text = msg.text.trim();
   if (!text) return;
@@ -319,34 +303,9 @@ async function handleMessage(msg) {
     return handleCommand(msg, cmd);
   }
   if (text === BTN_DIRECTIONS) return sendDirections(chatId, getSession(chatId));
-  if (text === BTN_CONTACTS) return tg.sendMessage(chatId, CONTACTS, { reply_markup: mainKeyboard });
-  if (text === BTN_TOUR) return converse(chatId, msg.from, 'Хочу подобрать тур');
+  if (text === BTN_CONTACTS) return say(chatId, CONTACTS, { reply_markup: mainKeyboard });
+  if (text === BTN_TOUR) return startTour(chatId);
   return converse(chatId, msg.from, text);
-}
-
-async function handleCallback(cb) {
-  const chatId = cb.message?.chat?.id;
-  if (!chatId) return;
-  const s = getSession(chatId);
-  const messageId = cb.message.message_id;
-
-  if (s.stage !== 'confirming' || leads.missingFields(s.lead).length !== 0) {
-    await tg.answerCallback(cb.id, 'Эта заявка уже обработана');
-    return tg.removeKeyboard(chatId, messageId);
-  }
-  await tg.answerCallback(cb.id);
-  await tg.removeKeyboard(chatId, messageId);
-
-  if (cb.data === 'lead:confirm') {
-    pushHistory(s, 'user', 'Всё верно, отправляйте');
-    return submitLead(chatId, cb.from, s);
-  }
-  if (cb.data === 'lead:edit') {
-    const text = 'Хорошо, что нужно изменить? Напишите, и я поправлю.';
-    pushHistory(s, 'user', 'Хочу изменить данные заявки');
-    pushHistory(s, 'assistant', text);
-    return tg.sendMessage(chatId, text);
-  }
 }
 
 // ---------- Запуск: long polling ----------
@@ -366,10 +325,6 @@ function enqueue(chatId, job) {
 
 function dispatch(update) {
   if (update.message) enqueue(update.message.chat.id, () => handleMessage(update.message));
-  else if (update.callback_query) {
-    const chatId = update.callback_query.message?.chat?.id;
-    if (chatId) enqueue(chatId, () => handleCallback(update.callback_query));
-  }
 }
 
 async function resendUnnotified() {
@@ -383,24 +338,17 @@ async function resendUnnotified() {
 async function start() {
   const me = await tg.getMe();
   await tg.call('deleteWebhook'); // long polling не работает вместе с вебхуком
-  await tg.call('setMyCommands', {
-    commands: [
-      { command: 'start', description: 'Начать' },
-      { command: 'directions', description: 'Направления' },
-      { command: 'contacts', description: 'Контакты агентства' },
-      { command: 'reset', description: 'Начать заново' },
-    ],
-  });
+  const publicCommands = [
+    { command: 'start', description: 'Начать' },
+    { command: 'directions', description: 'Направления' },
+    { command: 'contacts', description: 'Контакты агентства' },
+    { command: 'reset', description: 'Начать заново' },
+  ];
+  await tg.call('setMyCommands', { commands: publicCommands });
   if (config.adminChatId) {
     await tg
       .call('setMyCommands', {
-        commands: [
-          { command: 'start', description: 'Начать' },
-          { command: 'directions', description: 'Направления' },
-          { command: 'contacts', description: 'Контакты агентства' },
-          { command: 'reset', description: 'Начать заново' },
-          { command: 'leads', description: 'Последние 5 заявок' },
-        ],
+        commands: [...publicCommands, { command: 'leads', description: 'Последние 5 заявок' }],
         scope: { type: 'chat', chat_id: Number(config.adminChatId) },
       })
       .catch(() => {});

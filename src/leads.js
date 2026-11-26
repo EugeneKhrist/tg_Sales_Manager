@@ -1,5 +1,5 @@
 'use strict';
-// Заявка: поля, проверка в коде, текст сводки, хранение в leads.json.
+// Заявка: поля, проверка в коде, хранение в leads.json, сообщения владельцу.
 // Модель только «достаёт» данные из диалога — а решает, всё ли заполнено, этот код.
 
 const fs = require('fs');
@@ -7,45 +7,25 @@ const config = require('./config');
 const { formatDateTime } = require('./time');
 const { escapeHtml, log } = require('./util');
 
-// Порядок = порядок вопросов клиенту
-const FIELD_ORDER = [
-  'destination',
-  'departure_city',
-  'dates',
-  'nights',
-  'adults',
-  'children',
-  'children_ages',
-  'budget_kzt',
-  'preferences',
-  'name',
-  'phone',
-];
+// Обязательные поля (в порядке вопросов клиенту)
+const REQUIRED = ['destination', 'month', 'budget_kzt'];
+// Необязательные: заполняются, только если клиент сам о них сказал
+const OPTIONAL = ['notes', 'name', 'phone'];
+const FIELD_ORDER = [...REQUIRED, ...OPTIONAL];
 
 const LABELS = {
-  destination: 'Направление',
-  departure_city: 'Город вылета',
-  dates: 'Даты / месяц',
-  nights: 'Ночей',
-  adults: 'Взрослых',
-  children: 'Детей',
-  children_ages: 'Возраст детей',
-  budget_kzt: 'Бюджет на всех',
-  preferences: 'Пожелания',
+  destination: 'Направление (можно несколько)',
+  month: 'Месяц отпуска',
+  budget_kzt: 'Бюджет на всех в тенге',
+  notes: 'Дополнительные пожелания',
   name: 'Имя',
   phone: 'Телефон',
 };
 
 // Что отвечаем клиенту, если модель вернула неподходящее значение
 const INVALID_HINT = {
-  nights: 'Подскажите, пожалуйста, количество ночей числом — например, 7 или 10.',
-  adults: 'Уточните, пожалуйста, сколько взрослых поедет — числом, например 2.',
-  children: 'Уточните, пожалуйста, сколько детей поедет — числом (если детей нет, напишите 0).',
   budget_kzt:
-    'Подскажите, пожалуйста, общий бюджет на всех в тенге — числом, например 900 000.',
-  name: 'Подскажите, пожалуйста, как к вам обращаться — имя буквами.',
-  phone:
-    'Похоже, номер указан неполностью. Напишите, пожалуйста, телефон для связи, например +7 701 123 45 67.',
+    'Подскажите, пожалуйста, общий бюджет на всех в тенге числом, например 900 000.',
 };
 
 const EMPTY_WORDS = new Set([
@@ -57,6 +37,7 @@ const isEmptyWord = (raw) =>
   typeof raw === 'string' && EMPTY_WORDS.has(raw.trim().toLowerCase());
 
 function cleanStr(v, max = 200) {
+  if (Array.isArray(v)) v = v.map((x) => String(x).trim()).filter(Boolean).join(', ');
   if (typeof v !== 'string' && typeof v !== 'number') return null;
   const s = String(v)
     .replace(/[\u0000-\u001f\u007f]/g, ' ')
@@ -73,11 +54,6 @@ function toNum(v) {
     if (/^\d+(\.\d+)?$/.test(s)) return Number(s);
   }
   return NaN;
-}
-
-function intInRange(v, min, max) {
-  const n = toNum(v);
-  return Number.isInteger(n) && n >= min && n <= max ? n : null;
 }
 
 // +7XXXXXXXXXX или null
@@ -97,18 +73,13 @@ function formatPhone(p) {
 }
 
 const NORMALIZERS = {
-  destination: (v) => cleanStr(v, 60),
-  departure_city: (v) => cleanStr(v, 60),
-  dates: (v) => cleanStr(v, 60),
-  nights: (v) => intInRange(v, 1, 60),
-  adults: (v) => intInRange(v, 1, 20),
-  children: (v) => intInRange(v, 0, 10),
-  children_ages: (v) => cleanStr(v, 80),
+  destination: (v) => cleanStr(v, 100),
+  month: (v) => cleanStr(v, 60),
   budget_kzt: (v) => {
     const n = toNum(v);
     return Number.isFinite(n) && n >= 10000 && n <= 1e9 ? Math.round(n) : null;
   },
-  preferences: (v) => cleanStr(v, 300),
+  notes: (v) => cleanStr(v, 300),
   name: (v) => {
     const s = cleanStr(v, 60);
     return s && /\p{L}{2,}/u.test(s) ? s : null;
@@ -134,7 +105,7 @@ function mergeFields(lead, incoming, { userTexts } = {}) {
   for (const key of FIELD_ORDER) {
     const raw = incoming[key];
     if (raw === null || raw === undefined) continue;
-    const value = NORMALIZERS[key](raw);
+    let value = NORMALIZERS[key](raw);
     if (value === null) {
       if (!isEmptyWord(raw)) rejected.push(key);
       continue;
@@ -143,50 +114,23 @@ function mergeFields(lead, incoming, { userTexts } = {}) {
       rejected.push(key);
       continue;
     }
+    if (key === 'notes' && lead.notes && !lead.notes.includes(value)) {
+      value = `${lead.notes}; ${value}`.slice(0, 300); // пожелания накапливаются
+    }
     if (lead[key] !== value) {
       lead[key] = value;
       changed = true;
     }
   }
-
-  // Согласованность «дети ↔ возраст детей»
-  if (lead.children === 0) lead.children_ages = 'нет';
-  else if (lead.children > 0 && lead.children_ages === 'нет') delete lead.children_ages;
-
   return { changed, rejected };
 }
 
 // Какие обязательные поля ещё не заполнены (в порядке вопросов)
 function missingFields(lead) {
-  return FIELD_ORDER.filter((key) => {
-    if (key === 'children_ages' && !(lead.children > 0)) return false;
-    return lead[key] === undefined || lead[key] === null;
-  });
+  return REQUIRED.filter((key) => lead[key] === undefined || lead[key] === null);
 }
 
 const money = (n) => `${Number(n).toLocaleString('ru-RU')} ₸`;
-
-function groupText(f) {
-  const kids = f.children > 0 ? `${f.children} реб. (${f.children_ages})` : 'без детей';
-  return `${f.adults ?? '—'} взр., ${kids}`;
-}
-
-// Сводка для клиента (обычный текст)
-function summaryText(f) {
-  return [
-    'Давайте сверим заявку:',
-    `🌍 Направление: ${f.destination}`,
-    `🛫 Вылет из: ${f.departure_city}`,
-    `📅 Даты: ${f.dates}, ночей: ${f.nights}`,
-    `👨‍👩‍👧 Состав: ${groupText(f)}`,
-    `💰 Бюджет на всех: ${money(f.budget_kzt)}`,
-    `🎯 Пожелания: ${f.preferences}`,
-    `👤 Имя: ${f.name}`,
-    `📞 Телефон: ${formatPhone(f.phone)}`,
-    '',
-    'Всё верно? Если да — отправляю заявку менеджеру.',
-  ].join('\n');
-}
 
 // ---------- Хранение (leads.json) ----------
 
@@ -252,27 +196,26 @@ function clientLine(c) {
   return `${name}${who} · <a href="tg://user?id=${c.chat_id}">открыть чат</a>`;
 }
 
+const e = (v) => (v === undefined || v === null || v === '' ? '—' : escapeHtml(v));
+
 function adminMessage(rec) {
   const f = rec.fields;
   const title = rec.partial
-    ? `⚠️ <b>Частичная заявка №${rec.id}</b> (бот не смог дособрать данные — перезвоните клиенту)`
+    ? `⚠️ <b>Частичная заявка №${rec.id}</b> (бот не смог дособрать данные — свяжитесь с клиентом)`
     : `🆕 <b>Новая заявка №${rec.id}</b>`;
-  const e = (v) => (v === undefined || v === null || v === '' ? '—' : escapeHtml(v));
-  return [
+  const lines = [
     title,
     `🕒 ${formatDateTime(new Date(rec.created_at))}`,
     '',
     `🌍 Направление: ${e(f.destination)}`,
-    `🛫 Вылет из: ${e(f.departure_city)}`,
-    `📅 Даты: ${e(f.dates)} · ночей: ${e(f.nights)}`,
-    `👨‍👩‍👧 Состав: ${escapeHtml(groupText(f))}`,
+    `📅 Месяц отпуска: ${e(f.month)}`,
     `💰 Бюджет на всех: ${f.budget_kzt ? escapeHtml(money(f.budget_kzt)) : '—'}`,
-    `🎯 Пожелания: ${e(f.preferences)}`,
-    `👤 Имя: ${e(f.name)}`,
-    `📞 Телефон: ${escapeHtml(formatPhone(f.phone))}`,
-    '',
-    `✉️ Telegram клиента: ${clientLine(rec.client)}`,
-  ].join('\n');
+  ];
+  if (f.notes) lines.push(`🎯 Пожелания: ${e(f.notes)}`);
+  if (f.name) lines.push(`👤 Имя: ${e(f.name)}`);
+  if (f.phone) lines.push(`📞 Телефон: ${escapeHtml(formatPhone(f.phone))}`);
+  lines.push('', `✉️ Telegram клиента: ${clientLine(rec.client)}`);
+  return lines.join('\n');
 }
 
 // Короткий список для команды /leads
@@ -282,17 +225,18 @@ function leadsListText(list) {
     const f = rec.fields;
     const user = rec.client.username ? `@${escapeHtml(rec.client.username)}` : 'без username';
     const flag = rec.partial ? ' ⚠️ частичная' : '';
+    const contact = f.phone ? ` · ${escapeHtml(formatPhone(f.phone))}` : '';
     return [
       `<b>№${rec.id}</b> · ${formatDateTime(new Date(rec.created_at))}${flag}`,
-      `${escapeHtml(f.name || '—')} · ${escapeHtml(formatPhone(f.phone))} · ${user}`,
-      `${escapeHtml(f.destination || '—')} из ${escapeHtml(f.departure_city || '—')}, ${escapeHtml(f.dates || '—')}, ${escapeHtml(f.nights || '—')} н.`,
-      `${escapeHtml(groupText(f))} · ${f.budget_kzt ? escapeHtml(money(f.budget_kzt)) : '—'}`,
+      `${e(f.destination)} · ${e(f.month)} · ${f.budget_kzt ? escapeHtml(money(f.budget_kzt)) : '—'}`,
+      `${escapeHtml(rec.client.first_name || '—')} · ${user}${contact}`,
     ].join('\n');
   });
   return `<b>Последние заявки (${list.length})</b>\n\n` + blocks.join('\n\n');
 }
 
 module.exports = {
+  REQUIRED,
   FIELD_ORDER,
   LABELS,
   INVALID_HINT,
@@ -300,7 +244,6 @@ module.exports = {
   formatPhone,
   mergeFields,
   missingFields,
-  summaryText,
   createLead,
   markNotified,
   unnotifiedLeads,
