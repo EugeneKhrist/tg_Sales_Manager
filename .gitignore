@@ -1,0 +1,15 @@
+# Секреты (ключи бота и OpenRouter) — НИКОГДА не коммитить
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Личные данные клиентов (leads.json, его временные и битые копии)
+leads.json*
+
+# Служебное
+node_modules/
+*.log
+.DS_Store
+.claude/
